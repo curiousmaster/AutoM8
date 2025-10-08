@@ -94,16 +94,16 @@ autom8
 
 ```
 autom8/
-... autom8.py
-... Makefile
-... README.md
-... INSTALL.md
-... inventory/
-.   ... hosts.yml
-... playbooks/
-    ... deploy_firewall.yml
-    ... backup_switch.yml
-    ... verify_config.yml
+|-- autom8.py
+|-- Makefile
+|-- README.md
+|-- INSTALL.md
+|-- inventory/
+|   |-- hosts.yml
+|-- playbooks/
+    |-- deploy_firewall.yml
+    |-- backup_switch.yml
+    |-- verify_config.yml
 ```
 
 ---
