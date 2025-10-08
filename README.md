@@ -1,4 +1,4 @@
-# Autom8 . Ansible TUI Wrapper
+# AutoM8 . Ansible Made Easy
 
 ```
    _____          __            _____     ______
