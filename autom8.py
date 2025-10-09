@@ -1,79 +1,86 @@
 #!/usr/bin/env python3
-#======================================================================
+# ======================================================================
 # File: autom8.py
 # Name: Autom8 . Ansible TUI Wrapper
-#
-#======================================================================
+# ======================================================================
 # SYNOPSIS
-#   Autom8 is a curses-based terminal UI for selecting Sites, Target Types,
-#   relevant Playbooks, and Hosts, then running ansible-playbook.
+#   Autom8 is a curses-based terminal UI for selecting Inventories, Sites,
+#   Target Types, relevant Playbooks, and Hosts, then running ansible-playbook.
 #
-# DESCRIPTION
-#   - Parses inventory/hosts.yml (YAML) for groups and hosts
-#   - Derives Sites from host var `site` (defaults to "other")
-#   - Filters Target Types (groups) by selected Site
-#   - Filters Playbooks by relevance to selected Target Type using:
-#       * playbook metadata.device_types, or
-#       * filename keywords fallback
-#   - Selection pane shows Site / Target / Playbook / Vault / Hosts
-#   - Curses-native vault password modal (writes temp --vault-password-file)
-#   - Displays full subprocess output in the Output/Status pane
-#   - Output pane supports scrolling, shows a scrollbar, and can be cleared
-#   - Focus highlighting: active pane title uses reverse video
-#   - Panes order: Site | Target Types | Playbooks | Selection | Output/Status
+# WHAT'S NEW (2025-10-09)
+#   - . Detect + list multiple inventories from inventory/*.yml
+#   - . Top horizontal "Inventories" tabs (./. to switch, ENTER to apply)
+#   - . "ALL (merged)" option: UI merges all files; runner uses multiple -i
+#   - . Site filtering still uses host var `site` (default "other")
+#   - . Live ansible output fixed via PTY (unbuffered, colored)
+#   - . Modal redraw fix (no black hole after closing)
+#   - . Panes order: Site . Target Types . Playbooks . Selected Hosts . Output
+#   - . CLI site pre-filter (case-insensitive, multi-word): `autom8 selu` / `autom8 Sweden North`
+#   - . Loads ALL inventory files, then filters display by site (post-merge)
+#   - . -h/--help via argparse, --no-splash toggle
 #
 # USAGE
 #   pip install pyyaml
-#   python3 autom8.py
-#     (Run from repo root so inventory/hosts.yml and playbooks/*.yml exist)
+#   python3 autom8.py [--no-splash] [SITE ...]
+#   (Run from repo root so inventory/*.yml and playbooks/*.yml exist)
 #
 # KEYS
-#   TAB / SHIFT+TAB  : switch pane (SHIFT+TAB also 353 on some terms)
-#   ./. or j/k       : navigate lists (or scroll output when focused there)
-#   PgUp/PgDn        : page scroll (in output pane)
-#   ENTER on Sites   : apply site filter
-#   ENTER on Groups  : open host selection modal
-#   SPACE (in modal) : toggle host selection
-#   v                : toggle vault mode (ON/OFF)
-#   r or F5          : run ansible-playbook
-#   c                : clear selected hosts
-#   x                : clear Output/Status pane
-#   q / ESC          : quit
+#   Global:
+#     TAB / SHIFT+TAB       : switch pane (SHIFT+TAB can be code 353)
+#     q / ESC               : quit
+#     v                     : toggle vault prompt (ON/OFF)
+#     r or F5               : run ansible-playbook
+#     x                     : clear Output/Status pane
+#     c                     : clear selected hosts
+#
+#   Inventories (top tabs):
+#     . / .                 : move between inventories (including ALL)
+#     ENTER                 : apply selected inventory (reloads data)
+#
+#   Sites:
+#     . / ., j / k          : navigate
+#     ENTER                 : apply site filter
+#
+#   Target Types (groups):
+#     . / ., j / k          : navigate
+#     ENTER                 : open Host Selection modal
+#
+#   Playbooks:
+#     . / ., j / k          : select playbook
+#
+#   Selection:
+#     (read-only summary)
+#
+#   Output:
+#     . / ., j / k, PgUp/PgDn, Home/End  : scroll
 #
 # CONFIG (env vars)
-#   ATUI_INVENTORY       default: inventory/hosts.yml
-#   ATUI_PLAYBOOKS       default: playbooks/*.yml
-#   AUTOM8_SPLASH        1 to show splash (default 1), 0 to disable
-#   AUTOM8_SPLASH_SECS   splash duration seconds (default 3)
-#   AUTOM8_LOGO_IDX      choose splash logo index (0..N-1), else random
+#   ATUI_INV_GLOB         default: inventory/*.yml
+#   ATUI_INVENTORY        (legacy) single file path; if set, added to list
+#   ATUI_PLAYBOOKS        default: playbooks/*.yml
+#   AUTOM8_SPLASH         1 to show splash (default 1), 0 to disable
+#   AUTOM8_SPLASH_SECS    splash duration seconds (default 3)
+#   AUTOM8_LOGO_IDX       choose splash logo index (0..N-1), else random
 #
 # INVENTORY ASSUMPTIONS
-#   - YAML format. Hosts can be nested under groups via children.
-#   - Example host with site:
-#       all:
-#         children:
-#           switches:
-#             hosts:
-#               sw1:
-#                 site: eu
-#               sw2:
-#                 site: us
+#   - YAML inventory; hosts may live under groups via children.
+#   - A host may define "site" var. If missing, defaults to "other".
+#   - A group (incl. `all`) may define vars.site which inherits to children/hosts
 #
-# PLAYBOOK METADATA (optional for better filtering)
+# PLAYBOOK METADATA (optional, for better relevance filtering)
 #   ---
 #   metadata:
 #     device_types:
 #       - switch
-#       - nxos
-#   # ... tasks etc.
+#       - ios
 #
 # AUTHOR
 #   Stefan Benediktsson (c) 2025
-#======================================================================
+# ======================================================================
 
-#======================================================================
+# ======================================================================
 # Imports
-#======================================================================
+# ======================================================================
 import curses
 import curses.panel
 import os
@@ -86,12 +93,17 @@ import queue
 import time
 import random
 import tempfile
-from typing import Dict, List, Tuple, Set
+import pty
+import fcntl
+import termios
+import argparse
+from typing import Dict, List, Tuple, Set, Optional
 
-#======================================================================
+# ======================================================================
 # Configuration
-#======================================================================
-INV_PATH = os.environ.get("ATUI_INVENTORY", "inventory/hosts.yml")
+# ======================================================================
+INV_GLOB = os.environ.get("ATUI_INV_GLOB", "inventory/*.yml")
+INV_LEGACY = os.environ.get("ATUI_INVENTORY")  # optional, legacy single file
 PB_GLOB = os.environ.get("ATUI_PLAYBOOKS", "playbooks/*.yml")
 SPLASH_ENABLED = os.environ.get("AUTOM8_SPLASH", "1") not in ("0", "false", "False", "")
 try:
@@ -99,9 +111,9 @@ try:
 except ValueError:
     SPLASH_SECS = 3.0
 
-#======================================================================
-# ASCII Art Logos (Autom8) . include your current logo as default
-#======================================================================
+# ======================================================================
+# ASCII Art Logos
+# ======================================================================
 ASCII_LOGOS = [
 r"""
    _____          __            _____     ______
@@ -121,25 +133,21 @@ except ValueError:
     _logo_idx = -1
 ASCII_LOGO = ASCII_LOGOS[_logo_idx] if 0 <= _logo_idx < len(ASCII_LOGOS) else random.choice(ASCII_LOGOS)
 
-#======================================================================
+# ======================================================================
 # Utility (safe addstr)
-#======================================================================
+# ======================================================================
 def safe_addstr(win, y: int, x: int, s: str, maxw: int, attr: int = 0):
-    """
-    Wrap curses.addnstr with bounds checking and a max width.
-    Avoids errors when terminal is small or string is wide.
-    """
     if y < 0 or x < 0:
         return
     try:
         win.addnstr(y, x, s, maxw, attr)
     except curses.error:
-        # Some terminals throw even on clipped, just ignore
         pass
 
-#======================================================================
-# Inventory & Playbook helpers
-#======================================================================
+# ======================================================================
+# Inventory loader/merger
+# ======================================================================
+
 def _collect_hosts_from_group(group_dict) -> Set[str]:
     hosts = set()
     if not isinstance(group_dict, dict):
@@ -151,56 +159,116 @@ def _collect_hosts_from_group(group_dict) -> Set[str]:
             hosts.update(_collect_hosts_from_group(child_group))
     return hosts
 
-def load_inventory(inv_path: str) -> Tuple[List[str], Dict[str, List[str]], Dict[str, str]]:
-    """
-    Returns (group_names, group_to_hosts, host_to_site)
-    - host_to_site default "other" when not set
-    """
-    if not os.path.exists(inv_path):
-        raise FileNotFoundError(f"Inventory not found: {inv_path}")
-    with open(inv_path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
 
+def _collect_sites_from_group(group_dict, host_sites: Dict[str, str], inherited_site: str = "other"):
+    """Recursively collect host.site mappings, honoring group-level vars.site inheritance.
+    - If a group has vars.site, it overrides the inherited site for that subtree.
+    - A host-level 'site' key (under hosts.<name> dict) overrides group vars.
+    - Falls back to 'other' when nothing is set.
+    """
+    if not isinstance(group_dict, dict):
+        return
+
+    site_here = inherited_site
+    vars_d = group_dict.get("vars", {})
+    if isinstance(vars_d, dict) and "site" in vars_d:
+        s = str(vars_d.get("site", "")).strip()
+        if s:
+            site_here = s
+
+    # Collect hosts under this group
+    hosts_d = group_dict.get("hosts", {})
+    if isinstance(hosts_d, dict):
+        for h, attrs in hosts_d.items():
+            host_site = site_here
+            if isinstance(attrs, dict) and "site" in attrs:
+                s2 = str(attrs.get("site", "")).strip()
+                if s2:
+                    host_site = s2
+            if h not in host_sites or host_sites[h] == "other":
+                host_sites[h] = host_site or "other"
+
+    # Recurse into children groups
+    children = group_dict.get("children", {})
+    if isinstance(children, dict):
+        for child in children.values():
+            _collect_sites_from_group(child, host_sites, site_here)
+
+
+def parse_inventory_dict(data: dict) -> Tuple[List[str], Dict[str, List[str]], Dict[str, str]]:
+    """
+    Returns (group_names, group_to_hosts, host_to_site) for a single parsed YAML dict.
+    - Collects hosts under both `all.children.*` and any top-level groups.
+    - Computes host.site by honoring group vars.site inheritance and host overrides.
+    """
     host_sites: Dict[str, str] = {}
 
-    def collect_sites(gdict):
-        if not isinstance(gdict, dict):
-            return
-        if "hosts" in gdict and isinstance(gdict["hosts"], dict):
-            for h, attrs in gdict["hosts"].items():
-                site = "other"
-                if isinstance(attrs, dict) and "site" in attrs:
-                    site = str(attrs["site"]).strip() or "other"
-                host_sites[h] = site
-        if "children" in gdict and isinstance(gdict["children"], dict):
-            for c in gdict["children"].values():
-                collect_sites(c)
+    # Gather sites with inheritance starting from 'all' and also from any top-level groups
+    root = data.get("all", {}) if isinstance(data, dict) else {}
+    _collect_sites_from_group(root, host_sites, inherited_site="other")
 
-    collect_sites(data.get("all", {}))
+    # Also look at any additional top-level groups outside 'all'
+    if isinstance(data, dict):
+        for gname, gdict in data.items():
+            if gname == "all" or not isinstance(gdict, dict):
+                continue
+            _collect_sites_from_group(gdict, host_sites, inherited_site="other")
 
     groups: List[str] = []
     mapping: Dict[str, List[str]] = {}
 
-    root = data.get('all', {})
+    # groups under all.children.*
     children = root.get('children', {}) if isinstance(root.get('children', {}), dict) else {}
     for gname, gdict in children.items():
         hosts = sorted(list(_collect_hosts_from_group(gdict)))
         groups.append(gname)
         mapping[gname] = hosts
 
-    # top-level groups fallback (in case groups aren't only under "all.children")
-    for gname, gdict in data.items():
-        if gname == 'all' or not isinstance(gdict, dict):
-            continue
-        if gname not in mapping:
-            mapping[gname] = sorted(list(_collect_hosts_from_group(gdict)))
-            groups.append(gname)
+    # top-level fallbacks (if any)
+    if isinstance(data, dict):
+        for gname, gdict in data.items():
+            if gname == 'all' or not isinstance(gdict, dict):
+                continue
+            if gname not in mapping:
+                mapping[gname] = sorted(list(_collect_hosts_from_group(gdict)))
+                groups.append(gname)
 
     return sorted(groups), mapping, host_sites
 
+
+def load_inventory_file(path: str) -> Tuple[List[str], Dict[str, List[str]], Dict[str, str]]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Inventory not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return parse_inventory_dict(data)
+
+
+def merge_inventories(parts: List[Tuple[List[str], Dict[str, List[str]], Dict[str, str]]]
+                      ) -> Tuple[List[str], Dict[str, List[str]], Dict[str, str]]:
+    merged_groups: Set[str] = set()
+    merged_map: Dict[str, Set[str]] = {}
+    merged_sites: Dict[str, str] = {}
+
+    for groups, gmap, hsites in parts:
+        merged_groups.update(groups)
+        for g, hosts in gmap.items():
+            merged_map.setdefault(g, set()).update(hosts)
+        # prefer first seen non-"other" site per host
+        for h, s in hsites.items():
+            if h not in merged_sites or merged_sites[h] == "other":
+                merged_sites[h] = s
+
+    final_map: Dict[str, List[str]] = {g: sorted(list(hs)) for g, hs in merged_map.items()}
+    return sorted(list(merged_groups)), final_map, merged_sites
+
+# ======================================================================
+# Playbooks
+# ======================================================================
 DEVICE_KEYWORDS = [
     "switch", "router", "firewall", "asa", "nxos", "ios", "iosxe", "iosxr", "pan", "forti"
 ]
+
 
 def load_playbooks(pb_glob: str) -> List[dict]:
     """
@@ -212,7 +280,6 @@ def load_playbooks(pb_glob: str) -> List[dict]:
     results = []
     for f in files:
         types = []
-        # Try reading a small header for metadata
         try:
             with open(f, 'r', encoding='utf-8') as fh:
                 head_lines = []
@@ -239,9 +306,9 @@ def load_playbooks(pb_glob: str) -> List[dict]:
         results.append({'file': f, 'name': os.path.basename(f), 'types': types})
     return results
 
-#======================================================================
-# Basic UI elements
-#======================================================================
+# ======================================================================
+# Basic UI panes
+# ======================================================================
 class ListPane:
     def __init__(self, win, title: str, items: List[str]):
         self.win = win
@@ -294,7 +361,7 @@ class OutputPane:
         self.win = win
         self.title = title
         self.lines: List[str] = []
-        self.scroll = 0   # number of lines down from top (top=0)
+        self.scroll = 0
         self.focus = False
 
     def append(self, text: str):
@@ -315,9 +382,9 @@ class OutputPane:
             self.scroll = max(0, self.scroll - 1)
         elif ch in (curses.KEY_DOWN, ord('j')):
             self.scroll = min(max_scroll, self.scroll + 1)
-        elif ch == curses.KEY_NPAGE:  # Page Down
+        elif ch == curses.KEY_NPAGE:  # PgDn
             self.scroll = min(max_scroll, self.scroll + view_h)
-        elif ch == curses.KEY_PPAGE:  # Page Up
+        elif ch == curses.KEY_PPAGE:  # PgUp
             self.scroll = max(0, self.scroll - view_h)
         elif ch == curses.KEY_HOME:
             self.scroll = 0
@@ -331,17 +398,13 @@ class OutputPane:
         title = f" {self.title} "
         title_attr = curses.A_REVERSE if self.focus else curses.A_BOLD
         safe_addstr(self.win, 0, max(1, (w - len(title)) // 2), title, w - 2, title_attr)
-
         view_h = max(1, h - 2)
         max_scroll = max(0, len(self.lines) - view_h)
         self.scroll = max(0, min(self.scroll, max_scroll))
         start = self.scroll
         visible = self.lines[start:start + view_h]
-
-        # content
         for i, line in enumerate(visible):
             safe_addstr(self.win, 1 + i, 1, line, max(1, w - 3))
-
         # scrollbar
         if len(self.lines) > view_h:
             sb_h = max(1, int(view_h * view_h / len(self.lines)))
@@ -351,18 +414,15 @@ class OutputPane:
                     self.win.addch(1 + sb_top + i, w - 2, '|')
                 except curses.error:
                     pass
-
         self.win.noutrefresh()
 
-#======================================================================
-# Selection Summary Pane
-#======================================================================
 class SelectionPane:
     def __init__(self, win, title="Selection"):
         self.win = win
         self.title = title
         self.focus = False
         self.data = {
+            "inventory": ".",
             "site": ".",
             "target": ".",
             "playbook": ".",
@@ -370,7 +430,9 @@ class SelectionPane:
             "vault": False
         }
 
-    def update(self, site=None, target=None, playbook=None, hosts=None, vault=None):
+    def update(self, inventory=None, site=None, target=None, playbook=None, hosts=None, vault=None):
+        if inventory is not None:
+            self.data["inventory"] = inventory
         if site is not None:
             self.data["site"] = site
         if target is not None:
@@ -391,6 +453,7 @@ class SelectionPane:
         safe_addstr(self.win, 0, max(1, (w - len(title)) // 2), title, w - 2, title_attr)
 
         lines = [
+            f"Inventory: {self.data['inventory']}",
             f"Site:      {self.data['site']}",
             f"Target:    {self.data['target']}",
             f"Playbook:  {self.data['playbook']}",
@@ -399,19 +462,16 @@ class SelectionPane:
             f"Hosts ({len(self.data['hosts'])}):"
         ]
         host_list = sorted(self.data["hosts"])
-        if host_list:
-            lines.extend(host_list)
-        else:
-            lines.append("  .")
+        lines.extend(host_list if host_list else ["  ."])
 
         for i, line in enumerate(lines[:h - 2]):
             safe_addstr(self.win, 1 + i, 1, line, w - 2)
 
         self.win.noutrefresh()
 
-#======================================================================
-# Modals: Host Selection & Password
-#======================================================================
+# ======================================================================
+# Modals
+# ======================================================================
 class HostModal:
     def __init__(self, stdscr, title: str, hosts: List[str], preselected: Set[str] = None):
         self.stdscr = stdscr
@@ -437,7 +497,6 @@ class HostModal:
             safe_addstr(win, 0, max(1, (width - len(title)) // 2), title, width - 2, curses.A_BOLD)
 
             view_h = height - 2
-
             if self.idx < self.scroll:
                 self.scroll = self.idx
             elif self.idx >= self.scroll + view_h:
@@ -470,10 +529,18 @@ class HostModal:
                     else:
                         self.selected.add(h)
             elif ch in (10, 13, curses.KEY_ENTER):
+                # Properly clean overlay
+                curses.curs_set(0)
                 curses.panel.update_panels()
+                # Full screen repaint to avoid .black hole.
+                self.stdscr.clear()
+                self.stdscr.refresh()
                 return set(self.selected)
             elif ch == 27:  # ESC
+                curses.curs_set(0)
                 curses.panel.update_panels()
+                self.stdscr.clear()
+                self.stdscr.refresh()
                 return set(preselected or set())
 
 class PasswordModal:
@@ -504,71 +571,161 @@ class PasswordModal:
             if ch in (10, 13, curses.KEY_ENTER):
                 curses.curs_set(0)
                 curses.panel.update_panels()
+                self.stdscr.clear()
+                self.stdscr.refresh()
                 return self.password
             elif ch == 27:  # ESC
                 curses.curs_set(0)
                 curses.panel.update_panels()
+                self.stdscr.clear()
+                self.stdscr.refresh()
                 return ""
             elif ch in (curses.KEY_BACKSPACE, 127, 8):
                 self.password = self.password[:-1]
             elif 32 <= ch <= 126:
                 self.password += chr(ch)
 
-#======================================================================
-# Runner (async subprocess)
-#======================================================================
+# ======================================================================
+# Inventories top tabs pane
+# ======================================================================
+class InventoriesPane:
+    """
+    A horizontal tabs bar listing:
+      [ ALL ] [ SEDEF.yml ] [ SELU.yml ] ...
+    Keys: ./. to move, ENTER to apply.
+    """
+    def __init__(self, win, title: str, items: List[str]):
+        self.win = win
+        self.title = title
+        self.items = items  # display names (e.g., 'ALL (merged)', 'SEDEF.yml')
+        self.idx = 0
+        self.focus = True
+
+    def set_items(self, items: List[str]):
+        self.items = items
+        self.idx = 0
+
+    def current(self) -> str:
+        return self.items[self.idx] if 0 <= self.idx < len(self.items) else ""
+
+    def handle_key(self, ch):
+        if not self.items:
+            return
+        if ch in (curses.KEY_LEFT,):
+            self.idx = (self.idx - 1) % len(self.items)
+        elif ch in (curses.KEY_RIGHT,):
+            self.idx = (self.idx + 1) % len(self.items)
+
+    def draw(self):
+        h, w = self.win.getmaxyx()
+        self.win.erase()
+        self.win.box()
+        title = f" {self.title} (./. to select, ENTER to load) "
+        title_attr = curses.A_REVERSE if self.focus else curses.A_BOLD
+        safe_addstr(self.win, 0, max(1, (w - len(title)) // 2), title, w - 2, title_attr)
+
+        # render centered tabs
+        if not self.items:
+            self.win.noutrefresh()
+            return
+
+        tab_texts = []
+        for i, name in enumerate(self.items):
+            if i == self.idx and self.focus:
+                tab_texts.append(f"[{name}]")
+            else:
+                tab_texts.append(f" {name} ")
+        text = "  ".join(tab_texts)
+        safe_addstr(self.win, 1, max(1, (w - len(text)) // 2), text, w - 2)
+
+        self.win.noutrefresh()
+
+# ======================================================================
+# Runner (PTY for live output)
+# ======================================================================
 class Runner(threading.Thread):
-    def __init__(self, cmd: List[str], outq: queue.Queue):
+    def __init__(self, cmd: List[str], outq: queue.Queue, env: Optional[dict] = None):
         super().__init__(daemon=True)
         self.cmd = cmd
         self.outq = outq
+        self.env = env or os.environ.copy()
 
     def run(self):
         try:
             self.outq.put(("info", "$ " + " ".join(self.cmd)))
+
+            # allocate PTY so ansible plays nice with line buffering + colors
+            master_fd, slave_fd = pty.openpty()
+
+            # Set raw-ish mode for smoother reading
+            try:
+                attrs = termios.tcgetattr(master_fd)
+                attrs[3] = attrs[3] & ~(termios.ECHO | termios.ICANON)
+                termios.tcsetattr(master_fd, termios.TCSANOW, attrs)
+            except Exception:
+                pass
+
             proc = subprocess.Popen(
                 self.cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                universal_newlines=True,
-                bufsize=1
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=self.env,
+                text=False,  # PTY gives us bytes; we decode per line
+                bufsize=0,
+                close_fds=True
             )
-            for line in iter(proc.stdout.readline, ''):
-                self.outq.put(("out", line.rstrip("\n")))
+            os.close(slave_fd)
+
+            # read loop
+            with os.fdopen(master_fd, 'rb', buffering=0) as m:
+                buf = b""
+                while True:
+                    chunk = m.read(1)
+                    if not chunk:
+                        break
+                    if chunk == b' ':
+                        try:
+                            line = buf.decode(errors='replace')
+                        except Exception:
+                            line = repr(buf)
+                        self.outq.put(("out", line))
+                        buf = b""
+                    else:
+                        buf += chunk
+
             rc = proc.wait()
+            # flush tail if any
+            if buf:
+                try:
+                    self.outq.put(("out", buf.decode(errors='replace')))
+                except Exception:
+                    self.outq.put(("out", repr(buf)))
             self.outq.put(("info", f"[Process exited with code {rc}]"))
         except FileNotFoundError:
             self.outq.put(("err", "ansible-playbook not found in PATH"))
         except Exception as e:
             self.outq.put(("err", f"Exception: {e!r}"))
 
-#======================================================================
+# ======================================================================
 # Splash
-#======================================================================
+# ======================================================================
 def show_splash(stdscr):
     if not SPLASH_ENABLED:
         return
-
     stdscr.clear()
     stdscr.refresh()
-
-    lines = ASCII_LOGO.strip("\n").splitlines()
+    lines = ASCII_LOGO.splitlines()
     height = len(lines) + 4
     width = max(len(l) for l in lines) + 4
-
     maxy, maxx = stdscr.getmaxyx()
     y = max(0, (maxy - height) // 2)
     x = max(0, (maxx - width) // 2)
-
     win = curses.newwin(height, width, y, x)
     win.box()
-
     for i, l in enumerate(lines):
         safe_addstr(win, 2 + i, 2, l, width - 4)
-
     safe_addstr(win, height - 2, 2, "Press any key to skip...", width - 4, curses.A_DIM)
-
     win.refresh()
     stdscr.nodelay(True)
     start = time.time()
@@ -582,26 +739,60 @@ def show_splash(stdscr):
     stdscr.clear()
     stdscr.refresh()
 
-#======================================================================
+# ======================================================================
 # App
-#======================================================================
+# ======================================================================
 class App:
-    def __init__(self, stdscr):
+    def __init__(self, stdscr, site_arg: Optional[str] = None):
         self.stdscr = stdscr
         curses.curs_set(0)
         self.stdscr.nodelay(False)
         self.stdscr.keypad(True)
 
-        # Splash first
+        # Splash
         show_splash(self.stdscr)
 
-        # Data
-        self.playbooks_meta = load_playbooks(PB_GLOB)        # list of dicts
-        self.groups, self.group_hosts, self.host_sites = load_inventory(INV_PATH)
+        # --- Inventories discovery ---
+        self.inventory_files: List[str] = sorted(glob.glob(INV_GLOB))
+        if INV_LEGACY and os.path.exists(INV_LEGACY) and INV_LEGACY not in self.inventory_files:
+            self.inventory_files.append(INV_LEGACY)
+
+        if not self.inventory_files:
+            raise FileNotFoundError(f"No inventories found with pattern {INV_GLOB} (or ATUI_INVENTORY).")
+
+        # build inventory display names (always show all files)
+        self.inv_display: List[str] = ["ALL (merged)"] + [os.path.basename(p) for p in self.inventory_files]
+        self.inv_selected_idx = 0  # 0 means ALL
+        self.inv_display_to_path: Dict[str, Optional[str]] = {"ALL (merged)": None}
+        for p in self.inventory_files:
+            self.inv_display_to_path[os.path.basename(p)] = p
+
+        # Playbooks
+        self.playbooks_meta = load_playbooks(PB_GLOB)
+
+        # CLI site filter handling
+        self.cli_site_raw: Optional[str] = site_arg if site_arg else None
+        self.cli_site: Optional[str] = self.cli_site_raw.strip() if self.cli_site_raw else None
+        self.cli_site_norm: Optional[str] = self.cli_site.lower() if self.cli_site else None
+
+        # Load combined data initially (ALL merged), then apply CLI site filter after merge
+        groups_all, gmap_all, hsites_all = self._load_current_inventory_data(raw=True)
+        total_hosts_all = len(hsites_all)
+        if self.cli_site_norm:
+            groups_f, gmap_f, hsites_f = self._apply_cli_site_filter(groups_all, gmap_all, hsites_all)
+            self._cli_info_msg = f"[INFO] Filtered {len(hsites_f)} of {total_hosts_all} hosts for site {self.cli_site}"
+            groups, gmap, hsites = groups_f, gmap_f, hsites_f
+        else:
+            self._cli_info_msg = None
+            groups, gmap, hsites = groups_all, gmap_all, hsites_all
+        self.groups, self.group_hosts, self.host_sites = groups, gmap, hsites
 
         # Sites
-        sites = sorted(set(self.host_sites.values())) if self.host_sites else []
-        self.sites = ["all"] + (sites if sites else ["other"])
+        if self.cli_site:
+            self.sites = [self.cli_site]
+        else:
+            sites = sorted(set(self.host_sites.values())) if self.host_sites else []
+            self.sites = ["all"] + (sites if sites else ["other"])
 
         # State
         self.selected_hosts: Set[str] = set()
@@ -612,33 +803,104 @@ class App:
         self.filtered_playbooks = list(self.playbooks_meta)
         self._last_group_for_filter = None  # to re-filter playbooks on change
 
-        # Layout: Site | Target Types | Playbooks | Selection (top) + Output (bottom)
+        # Layout
         maxy, maxx = self.stdscr.getmaxyx()
-        top_h = maxy - 10 if maxy > 24 else maxy - 8
-        bot_h = maxy - top_h
+        # Top bar for inventories
+        top_bar_h = 3
+        remaining_h = maxy - top_bar_h
+        top_h = remaining_h - 10 if remaining_h > 24 else remaining_h - 8
+        bot_h = max(6, remaining_h - top_h)
+
         col_w = max(20, maxx // 4)
+        # Inventories bar full width
+        self.win_inv = curses.newwin(top_bar_h, maxx, 0, 0)
+        # Four top panes:
+        self.win_sites = curses.newwin(top_h, col_w, top_bar_h, 0)
+        self.win_groups = curses.newwin(top_h, col_w, top_bar_h, col_w)
+        self.win_pb = curses.newwin(top_h, col_w, top_bar_h, col_w * 2)
+        self.win_sel = curses.newwin(top_h, maxx - col_w * 3, top_bar_h, col_w * 3)
+        # Bottom output
+        self.win_out = curses.newwin(bot_h, maxx, top_bar_h + top_h, 0)
 
-        self.win_sites = curses.newwin(top_h, col_w, 0, 0)
-        self.win_groups = curses.newwin(top_h, col_w, 0, col_w)
-        self.win_pb = curses.newwin(top_h, col_w, 0, col_w * 2)
-        self.win_sel = curses.newwin(top_h, maxx - col_w * 3, 0, col_w * 3)
-        self.win_out = curses.newwin(bot_h, maxx, top_h, 0)
-
-        self.pane_sites = ListPane(self.win_sites, "Sites", self.sites)
+        self.pane_inv = InventoriesPane(self.win_inv, "Inventories", self.inv_display)
+        self.pane_sites = ListPane(self.win_sites, (
+            f"Sites (locked: {self.cli_site})" if self.cli_site else "Sites"
+        ), self.sites)
         self.pane_groups = ListPane(self.win_groups, "Target Types (Groups)", self.filtered_groups)
         self.pane_pb = ListPane(self.win_pb, "Playbooks", [pb['name'] for pb in self.filtered_playbooks])
         self.pane_sel = SelectionPane(self.win_sel, "Selection")
         self.pane_out = OutputPane(self.win_out, "Output / Status")
 
-        self.panes = [self.pane_sites, self.pane_groups, self.pane_pb, self.pane_sel, self.pane_out]
+        # One-time CLI filter info message
+        self._cli_info_printed = False
+        if self._cli_info_msg and not self._cli_info_printed:
+            self.pane_out.append(self._cli_info_msg)
+            self._cli_info_printed = True
+
+        # Navigation order: Inventories . Sites . Groups . Playbooks . Selection . Output
+        self.panes = [self.pane_inv, self.pane_sites, self.pane_groups, self.pane_pb, self.pane_sel, self.pane_out]
         self.focus_idx = 0
         self.panes[self.focus_idx].focus = True
 
         # Async runner
         self.outq: queue.Queue = queue.Queue()
-        self.runner: Runner | None = None
+        self.runner: Optional[Runner] = None
 
-    #------------------ Filters ------------------#
+        # Pre-select CLI site filter on start (no-op if only one item)
+        if self.cli_site:
+            self.pane_sites.idx = 0
+            self.apply_site_filter()
+            self.pane_out.append(f"Site pre-filter active: {self.cli_site}")
+
+    # ------------------ Helpers for CLI site filtering ------------------ #
+    def _apply_cli_site_filter(self, groups: List[str], gmap: Dict[str, List[str]], hsites: Dict[str, str]) -> Tuple[List[str], Dict[str, List[str]], Dict[str, str]]:
+        """Return (groups,gmap,hsites) filtered to only hosts matching self.cli_site_norm (case-insensitive)."""
+        if not self.cli_site_norm:
+            return groups, gmap, hsites
+        filtered_hsites = {h: s for h, s in hsites.items() if str(s).lower() == self.cli_site_norm}
+        new_gmap: Dict[str, List[str]] = {}
+        new_groups: List[str] = []
+        for g, hosts in gmap.items():
+            sel = [h for h in hosts if h in filtered_hsites]
+            if sel:
+                new_gmap[g] = sel
+                new_groups.append(g)
+        return sorted(new_groups), new_gmap, filtered_hsites
+
+    # ------------------ Inventory data loader ------------------ #
+    def _load_current_inventory_data(self, raw: bool = False) -> Tuple[List[str], Dict[str, List[str]], Dict[str, str]]:
+        """
+        If inv_selected_idx == 0 . ALL (merged) across self.inventory_files
+        Else . single selected inventory file
+        If raw=True, never apply CLI site filtering (caller will post-filter).
+        Otherwise, apply CLI site filter within this method for correctness on tab change.
+        """
+        if self.inv_selected_idx == 0:
+            parts = []
+            for p in self.inventory_files:
+                try:
+                    parts.append(load_inventory_file(p))
+                except Exception:
+                    # Non-fatal: ignore broken inventories
+                    pass
+            if not parts:
+                raise RuntimeError("Failed to load any inventories for ALL (merged).")
+            groups, gmap, hsites = merge_inventories(parts)
+        else:
+            disp = self.inv_display[self.inv_selected_idx]
+            path = self.inv_display_to_path.get(disp)
+            if not path:
+                raise FileNotFoundError(f"Selected inventory path not found for {disp}")
+            groups, gmap, hsites = load_inventory_file(path)
+
+        if raw:
+            return groups, gmap, hsites
+        # Apply CLI site filter if set
+        if self.cli_site_norm:
+            return self._apply_cli_site_filter(groups, gmap, hsites)
+        return groups, gmap, hsites
+
+    # ------------------ Filters ------------------ #
     def apply_site_filter(self):
         site = self.pane_sites.current()
         if site == "all":
@@ -674,16 +936,18 @@ class App:
                 elif g in types or any(g in t for t in types):
                     filtered.append(pb)
                 else:
-                    # filename fallback heuristic
                     if g in pb['name'].lower():
                         filtered.append(pb)
             self.filtered_playbooks = filtered if filtered else list(self.playbooks_meta)
         self.pane_pb.set_items([pb['name'] for pb in self.filtered_playbooks])
 
-    #------------------ Helpers ------------------#
+    # ------------------ Status & nav helpers ------------------ #
     def draw_status(self):
         maxy, maxx = self.stdscr.getmaxyx()
-        status = f"[TAB] switch  [ENTER] Sites=filter / Groups=hosts  [r/F5] run  [v] vault:{'ON' if self.ask_vault else 'OFF'}  [c] clear hosts  [x] clear output  [q] quit"
+        status = (
+            f"[TAB] switch  [ENTER] Inventories=load / Sites=filter / Groups=hosts  "
+            f"[r/F5] run  [v] vault:{'ON' if self.ask_vault else 'OFF'}  [c] clear hosts  [x] clear output  [q] quit"
+        )
         safe_addstr(self.stdscr, maxy - 1, 0, " " * (maxx - 1), maxx - 1)
         safe_addstr(self.stdscr, maxy - 1, 1, status, maxx - 2, curses.A_REVERSE)
 
@@ -701,7 +965,6 @@ class App:
         if site != "all":
             hosts = [h for h in hosts if self.host_sites.get(h, "other") == site]
         hosts = sorted(hosts)
-
         modal = HostModal(self.stdscr, f"Select hosts in '{group}'", hosts,
                           preselected=self.selected_hosts & set(hosts))
         new_sel = modal.show()
@@ -715,6 +978,21 @@ class App:
 
         # update selection pane
         self.pane_sel.update(target=group, hosts=sorted(self.selected_hosts))
+
+    def _build_inventory_cli_args(self) -> List[str]:
+        """
+        For runner: when ALL (merged) is selected, pass multiple -i <file> flags.
+        Otherwise a single -i.
+        """
+        if self.inv_selected_idx == 0:
+            args: List[str] = []
+            for path in self.inventory_files:
+                args.extend(["-i", path])
+            return args
+        else:
+            disp = self.inv_display[self.inv_selected_idx]
+            path = self.inv_display_to_path.get(disp)
+            return ["-i", path] if path else []
 
     def run_ansible(self):
         if not self.filtered_playbooks:
@@ -740,7 +1018,13 @@ class App:
             return
 
         limit = ",".join(sorted(list(self.selected_hosts)))
-        cmd = ["ansible-playbook", "-i", INV_PATH, "-l", limit, pb_file]
+
+        cmd = ["ansible-playbook"] + self._build_inventory_cli_args() + ["-l", limit, pb_file]
+
+        env = os.environ.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
+        env.setdefault("ANSIBLE_FORCE_COLOR", "1")
+        # Leave default callback; PTY ensures streaming
 
         vault_file = None
         if self.ask_vault:
@@ -765,7 +1049,7 @@ class App:
 
         self.pane_out.clear()
         self.pane_out.append("Running: " + " ".join(cmd))
-        self.runner = Runner(cmd, self.outq)
+        self.runner = Runner(cmd, self.outq, env=env)
         self.runner.start()
 
         # cleanup vault file when done
@@ -792,11 +1076,46 @@ class App:
         except queue.Empty:
             pass
 
-    #------------------ Main loop ------------------#
+    # ------------------ Main loop ------------------ #
+    def _reload_inventories_apply(self):
+        # Re-load current selection.s data
+        try:
+            groups, gmap, hsites = self._load_current_inventory_data(raw=False)
+        except Exception as e:
+            self.pane_out.append(f"[ERROR] Failed loading inventory: {e}")
+            return
+
+        # Apply to state
+        self.groups, self.group_hosts, self.host_sites = groups, gmap, hsites
+
+        # rebuild sites (keep locked if CLI site is used)
+        if self.cli_site:
+            self.sites = [self.cli_site]
+        else:
+            sites = sorted(set(self.host_sites.values())) if self.host_sites else []
+            self.sites = ["all"] + (sites if sites else ["other"])
+        self.pane_sites.set_items(self.sites)
+
+        # clear selections that might not exist anymore
+        self.selected_hosts.clear()
+
+        # reset groups/playbooks
+        self.filtered_groups = list(self.groups)
+        self.pane_groups.set_items(self.filtered_groups)
+        self._last_group_for_filter = None
+        self.apply_playbook_filter()  # reset playbooks list
+
+        # refresh selection summary
+        inv_name = self.inv_display[self.inv_selected_idx]
+        self.pane_sel.update(inventory=inv_name, site=self.pane_sites.current(),
+                             target=self.pane_groups.current(), playbook=self.pane_pb.current(),
+                             hosts=sorted(self.selected_hosts))
+
     def mainloop(self):
-        # Include Output pane in navigation (already included in self.panes)
-        # Also support SHIFT+TAB as KEY_BTAB or code 353
         SHIFT_TAB = getattr(curses, 'KEY_BTAB', 353)
+
+        # Initial selection inventory name
+        self.pane_sel.update(inventory=self.inv_display[self.inv_selected_idx])
 
         while True:
             # auto-apply playbook filter when group selection changes
@@ -807,6 +1126,7 @@ class App:
 
             # keep selection pane synchronized every frame
             self.pane_sel.update(
+                inventory=self.inv_display[self.inv_selected_idx],
                 site=self.pane_sites.current(),
                 target=self.pane_groups.current(),
                 playbook=self.pane_pb.current(),
@@ -851,11 +1171,27 @@ class App:
                 self.run_ansible()
                 continue
 
-            # enter actions by pane
+            # per-pane actions
             focused = self.panes[self.focus_idx]
+
+            # Inventories top tabs
+            if focused is self.pane_inv:
+                if ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
+                    focused.handle_key(ch)
+                    continue
+                if ch in (10, 13, curses.KEY_ENTER):
+                    self.inv_selected_idx = self.pane_inv.idx  # apply
+                    self._reload_inventories_apply()
+                    # hard repaint to avoid artifacts
+                    self.stdscr.clear()
+                    self.stdscr.refresh()
+                    continue
+
+            # Sites ENTER applies filter
             if focused is self.pane_sites and ch in (10, 13, curses.KEY_ENTER):
                 self.apply_site_filter()
                 continue
+            # Groups ENTER opens host modal
             elif focused is self.pane_groups and ch in (10, 13, curses.KEY_ENTER):
                 self.open_host_modal()
                 continue
@@ -864,27 +1200,59 @@ class App:
             if hasattr(focused, "handle_key"):
                 focused.handle_key(ch)
 
-#======================================================================
+# ======================================================================
 # Entrypoint
-#======================================================================
-def _wrap(stdscr):
+# ======================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="autom8",
+        description="Autom8 . Ansible TUI Wrapper for selecting inventories, sites, and playbooks."
+    )
+    parser.add_argument(
+        "site",
+        nargs="*",
+        help="Optional site filter (case-insensitive, all trailing words are joined as one filter)."
+    )
+    parser.add_argument(
+        "--no-splash",
+        action="store_true",
+        help="Disable splash screen at startup."
+    )
+    return parser.parse_args()
+
+
+def _wrap(stdscr, site_arg: Optional[str] = None):
     try:
-        app = App(stdscr)
+        app = App(stdscr, site_arg=site_arg)
         app.mainloop()
     except Exception as e:
-        # Ensure terminal is reset on crash
         curses.endwin()
         print(f"Fatal error: {e}", file=sys.stderr)
         raise
 
+
 def main():
-    if not os.path.exists(INV_PATH):
-        print(f"Missing inventory: {INV_PATH}", file=sys.stderr)
-        sys.exit(1)
+    args = parse_args()
+
+    # Disable splash if requested
+    global SPLASH_ENABLED
+    if args.no_splash:
+        SPLASH_ENABLED = False
+
+    # Join all site words into one filter string
+    site_arg = " ".join(args.site).strip()
+    if site_arg == "":
+        site_arg = None
+
+    # Quick sanity: playbooks exist?
     if not glob.glob(PB_GLOB):
         print(f"No playbooks found at {PB_GLOB}", file=sys.stderr)
         sys.exit(1)
-    curses.wrapper(_wrap)
+
+    curses.wrapper(_wrap, site_arg=site_arg)
+
 
 if __name__ == "__main__":
     main()
+
