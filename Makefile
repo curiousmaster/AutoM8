@@ -145,7 +145,7 @@ env:
 deps: env
 	@echo ">>> Installing Python + Ansible dependencies into $(VENV_DIR)..."
 	@$(VENV_PIP) install --upgrade pip
-	@$(VENV_PIP) install pyyaml ansible ansible-lint paramiko
+	@$(VENV_PIP) install pyyaml ansible ansible-lint paramiko ansible-pylibssh
 	$(call log_action,"Installed Python + Ansible deps in venv")
 
 #----------------------------------------------------------------------
