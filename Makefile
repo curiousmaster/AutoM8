@@ -1,133 +1,102 @@
 #======================================================================
 # File: Makefile
-# Project: Autom8 . Ansible TUI Wrapper
-#======================================================================
-# Description:
-#   This Makefile automates full setup and installation of Autom8,
-#   using a user-local Python virtual environment (~/.venv).
-#   It installs Ansible, ansible-lint, and recommended Ansible Galaxy
-#   collections for multi-vendor networking, infrastructure, cloud,
-#   and security automation.
+# Project: AutoM8 · Ansible TUI Wrapper
+# System layout:
+#   Code:    /usr/local/lib/autom8/autom8_pkg
+#   Wrapper: /usr/local/sbin/autom8
 #======================================================================
 
-PYTHON       := python3
-INSTALL_DIR  := /usr/local/sbin
-SCRIPT_NAME  := autom8
-SOURCE_FILE  := autom8.py
-VENV_DIR     := $(HOME)/.venv
-VENV_PYTHON  := $(VENV_DIR)/bin/python
-VENV_PIP     := $(VENV_DIR)/bin/pip
-VENV_ANSIBLE := $(VENV_DIR)/bin/ansible
-VENV_GALAXY  := $(VENV_DIR)/bin/ansible-galaxy
-LOGFILE      := /var/log/autom8-install.log
+PYTHON        := python3
+PREFIX        ?= /usr/local
+BIN_DIR       := $(PREFIX)/sbin
+PKG_ROOT      := $(PREFIX)/lib/autom8
+WRAPPER_NAME  := autom8
 
-#======================================================================
-# Ansible Galaxy Collections (core + extended)
-#======================================================================
-# These collections cover Cisco, multi-vendor networking, infrastructure,
-# cloud, security, and monitoring integrations.
-# They will be installed automatically with: make collections
-#======================================================================
+VENV_DIR      := $(HOME)/.venv
+VENV_PYTHON   := $(VENV_DIR)/bin/python
+VENV_PIP      := $(VENV_DIR)/bin/pip
+VENV_GALAXY   := $(VENV_DIR)/bin/ansible-galaxy
+
+LOGFILE       := /var/log/autom8-install.log
 
 GALAXY_COLLECTIONS := \
-	# --- Cisco ecosystem --- \
-	cisco.ios \
-	cisco.nxos \
-	cisco.asa \
-	cisco.aci \
-	cisco.meraki \
-	cisco.iosxr \
-	cisco.dnac \
-	cisco.intersight \
-	\
-	# --- Multi-vendor networking --- \
-	arista.eos \
-	junipernetworks.junos \
-	fortinet.fortios \
-	paloaltonetworks.panos \
-	f5networks.f5_modules \
-	checkpoint.checkpoint \
-	vyos.vyos \
-	dellemc.os10 \
-	lenovo.lenovoos10 \
-	hpe.procurve \
-	hpe.ilo \
-	\
-	# --- Infrastructure and system management --- \
-	ansible.posix \
-	ansible.utils \
-	community.general \
-	community.docker \
-	community.kubernetes \
-	community.vmware \
-	community.windows \
-	community.mysql \
-	community.postgresql \
-	community.network \
-	\
-	# --- Cloud and virtualization --- \
-	amazon.aws \
-	google.cloud \
-	azure.azcollection \
-	oracle.oci \
-	openstack.cloud \
-	hetzner.hcloud \
-	linode.cloud \
-	digitalocean.cloud \
-	vmware.vmware_rest \
-	kubernetes.core \
-	\
-	# --- Security and compliance --- \
-	community.crypto \
-	community.hashi_vault \
-	community.general.hardened \
-	ansible.lockdown \
-	splunk.es \
-	graylog.graylog \
-	theforeman.foreman \
-	servicenow.servicenow \
-	\
-	# --- Monitoring, logging, and DevOps --- \
-	community.grafana \
-	community.zabbix \
-	community.prometheus \
-	community.influxdb \
-	community.elastic \
-	community.git \
-	community.jenkins \
-	community.terraform \
-	community.nagios \
-	community.slack \
-	\
-	# --- Utilities and shared helpers --- \
-	ansible.netcommon \
-	ansible.net_tools \
-	community.time
+  cisco.ios \
+  cisco.nxos \
+  cisco.asa \
+  cisco.aci \
+  cisco.meraki \
+  cisco.iosxr \
+  cisco.dnac \
+  cisco.intersight \
+  arista.eos \
+  junipernetworks.junos \
+  fortinet.fortios \
+  paloaltonetworks.panos \
+  f5networks.f5_modules \
+  checkpoint.checkpoint \
+  vyos.vyos \
+  dellemc.os10 \
+  lenovo.lenovoos10 \
+  hpe.procurve \
+  hpe.ilo \
+  ansible.posix \
+  ansible.utils \
+  community.general \
+  community.docker \
+  community.kubernetes \
+  community.vmware \
+  community.windows \
+  community.mysql \
+  community.postgresql \
+  community.network \
+  amazon.aws \
+  google.cloud \
+  azure.azcollection \
+  oracle.oci \
+  openstack.cloud \
+  hetzner.hcloud \
+  linode.cloud \
+  digitalocean.cloud \
+  vmware.vmware_rest \
+  kubernetes.core \
+  community.crypto \
+  community.hashi_vault \
+  community.general.hardened \
+  ansible.lockdown \
+  splunk.es \
+  graylog.graylog \
+  theforeman.foreman \
+  servicenow.servicenow \
+  community.grafana \
+  community.zabbix \
+  community.prometheus \
+  community.influxdb \
+  community.elastic \
+  community.git \
+  community.jenkins \
+  community.terraform \
+  community.nagios \
+  community.slack \
+  ansible.netcommon \
+  ansible.net_tools \
+  community.time
 
-#----------------------------------------------------------------------
-# Default target
-#----------------------------------------------------------------------
-all: install
+# ---------------- Default target ----------------
+all: install-system
 
-#----------------------------------------------------------------------
-# Log helper
-#----------------------------------------------------------------------
+# ---------------- Log helper ----------------
 define log_action
 	@echo "[$$(date '+%Y-%m-%d %H:%M:%S')] $1 (by $$(whoami))" | sudo tee -a $(LOGFILE) > /dev/null
 endef
 
-#----------------------------------------------------------------------
-# Install required system packages (Debian/Ubuntu)
-#----------------------------------------------------------------------
+# ---------------- System deps (Debian/Ubuntu) ----------------
 system-packages:
-	@echo ">>> Installing system dependencies (python3, pip, git, venv)..."
+	@echo ">>> Installing system dependencies (python3, pip, venv, rsync, git)..."
 	@sudo apt-get update -qq
-	@sudo apt-get install -y python3 python3-pip python3-venv git make
+	@sudo apt-get install -y python3 python3-pip python3-venv rsync git make
 	$(call log_action,"Installed system dependencies")
 
-#----------------------------------------------------------------------
-# Create virtual environment in ~/.venv
-#----------------------------------------------------------------------
+# ---------------- Virtual environment ----------------
 env:
 	@echo ">>> Creating user-local venv in $(VENV_DIR)..."
 	@mkdir -p $(VENV_DIR)
@@ -139,81 +108,96 @@ env:
 	fi
 	$(call log_action,"Created/verified venv at $(VENV_DIR)")
 
-#----------------------------------------------------------------------
-# Install Python + Ansible dependencies inside venv
-#----------------------------------------------------------------------
+# ---------------- Python/Ansible deps ----------------
 deps: env
 	@echo ">>> Installing Python + Ansible dependencies into $(VENV_DIR)..."
 	@$(VENV_PIP) install --upgrade pip
 	@$(VENV_PIP) install pyyaml ansible ansible-lint paramiko ansible-pylibssh
 	$(call log_action,"Installed Python + Ansible deps in venv")
 
-#----------------------------------------------------------------------
-# Install Ansible Galaxy collections
-#----------------------------------------------------------------------
+# ---------------- Ansible Galaxy collections ----------------
 collections: deps
 	@echo ">>> Installing Ansible Galaxy collections..."
 	@for coll in $(GALAXY_COLLECTIONS); do \
 		echo ">>> Installing $$coll..."; \
 		$(VENV_GALAXY) collection install $$coll --force || true; \
 	done
-	$(call log_action,"Installed Ansible Galaxy collections: $(GALAXY_COLLECTIONS)")
+	$(call log_action,"Installed Ansible Galaxy collections")
 
-#----------------------------------------------------------------------
-# Full setup (system packages + venv + dependencies + collections + install)
-#----------------------------------------------------------------------
-setup: system-packages deps collections install
-	@echo ">>> Full Autom8 setup complete."
-	$(call log_action,"Completed full Autom8 setup (with Ansible collections)")
+# ---------------- System install (/usr/local/lib/autom8 + wrapper) ----------------
+install-system: deps
+	@echo ">>> Installing AutoM8 package to $(PKG_ROOT)/autom8_pkg ..."
+	@sudo mkdir -p $(PKG_ROOT)
+	@sudo rsync -a --delete autom8_pkg/ $(PKG_ROOT)/autom8_pkg/
+	@sudo mkdir -p $(BIN_DIR)
+	@echo ">>> Installing wrapper to $(BIN_DIR)/$(WRAPPER_NAME)..."
+	@printf '%s\n' \
+'#!/usr/bin/env bash' \
+'VENV_PY="$(VENV_PYTHON)"' \
+'PKG_ROOT="$(PKG_ROOT)"' \
+'export PYTHONPATH="${PKG_ROOT}:${PYTHONPATH}"' \
+'exec "$$VENV_PY" -m autom8_pkg "$$@"' \
+	| sudo tee $(BIN_DIR)/$(WRAPPER_NAME) >/dev/null
+	@sudo chmod 755 $(BIN_DIR)/$(WRAPPER_NAME)
+	@sudo chown root:root $(BIN_DIR)/$(WRAPPER_NAME)
+	$(call log_action,"Installed AutoM8 under $(PKG_ROOT) with wrapper $(BIN_DIR)/$(WRAPPER_NAME)")
+	@echo ">>> Done. Run: $(WRAPPER_NAME)"
 
-#----------------------------------------------------------------------
-# Install Autom8 system-wide
-#----------------------------------------------------------------------
-install: $(SOURCE_FILE)
-	@echo ">>> Installing Autom8 to $(INSTALL_DIR)/$(SCRIPT_NAME)..."
-	@sudo install -m 755 $(SOURCE_FILE) $(INSTALL_DIR)/$(SCRIPT_NAME)
-	@sudo sed -i '1c\#\!$(VENV_PYTHON)' $(INSTALL_DIR)/$(SCRIPT_NAME)
-	$(call log_action,"Installed Autom8 binary to $(INSTALL_DIR)")
-	@echo ">>> Installation complete."
-	@echo ">>> Run it with: $(SCRIPT_NAME)"
+# ---------------- Update system copy (code sync only) ----------------
+update-system:
+	@echo ">>> Updating AutoM8 package at $(PKG_ROOT)..."
+	@sudo rsync -a --delete autom8_pkg/ $(PKG_ROOT)/autom8_pkg/
+	$(call log_action,"Updated AutoM8 under $(PKG_ROOT)")
 
-#----------------------------------------------------------------------
-# Uninstall Autom8
-#----------------------------------------------------------------------
-uninstall:
-	@echo ">>> Removing Autom8..."
-	@sudo rm -f $(INSTALL_DIR)/$(SCRIPT_NAME)
-	$(call log_action,"Uninstalled Autom8 from $(INSTALL_DIR)")
+# ---------------- Uninstall system copy ----------------
+uninstall-system:
+	@echo ">>> Removing AutoM8 system install..."
+	@sudo rm -f $(BIN_DIR)/$(WRAPPER_NAME)
+	@sudo rm -rf $(PKG_ROOT)
+	$(call log_action,"Removed AutoM8 from $(BIN_DIR) and $(PKG_ROOT)")
 	@echo ">>> Done."
 
-#----------------------------------------------------------------------
-# Clean environment
-#----------------------------------------------------------------------
+# ---------------- Dev helpers (run from repo) ----------------
+run:
+	@$(VENV_PYTHON) -m autom8_pkg
+
+dev:
+	@$(VENV_PYTHON) -m autom8_pkg -d
+
+# ---------------- Clean ----------------
 clean:
-	@echo ">>> Cleaning cache and virtual environment..."
-	rm -rf __pycache__ *.pyc *.pyo
-	rm -rf $(VENV_DIR)
+	@echo ">>> Cleaning cache..."
+	rm -rf __pycache__ **/__pycache__ *.pyc *.pyo
 	find . -type f -name '*.log' -delete
 	@echo ">>> Done."
-	$(call log_action,"Cleaned environment and removed venv")
+	$(call log_action,"Cleaned caches")
 
-#----------------------------------------------------------------------
-# Help target
-#----------------------------------------------------------------------
+clean-all: clean
+	@echo ">>> Removing venv at $(VENV_DIR)..."
+	rm -rf $(VENV_DIR)
+	$(call log_action,"Removed venv")
+
+# ---------------- Help ----------------
 help:
 	@echo ""
-	@echo "Autom8 . Makefile Commands"
+	@echo "AutoM8 · Makefile Commands"
 	@echo "=========================="
-	@echo "make setup        - Full setup (system, venv, deps, collections, install)"
-	@echo "make env          - Create Python venv under ~/.venv"
-	@echo "make deps         - Install Python/Ansible deps into venv"
-	@echo "make collections  - Install Ansible Galaxy collections"
-	@echo "make install      - Install Autom8 binary to /usr/local/sbin"
-	@echo "make uninstall    - Remove Autom8 binary"
-	@echo "make clean        - Remove cache and venv"
+	@echo "make system-packages - Install OS deps (python, pip, venv, rsync, git)"
+	@echo "make env             - Create Python venv under ~/.venv"
+	@echo "make deps            - Install Python/Ansible deps into venv"
+	@echo "make collections     - Install Ansible Galaxy collections"
+	@echo "make install-system  - Install package to /usr/local/lib/autom8 + wrapper"
+	@echo "make update-system   - Update code at /usr/local/lib/autom8"
+	@echo "make uninstall-system- Remove wrapper and package dir"
+	@echo "make run             - Run from repo via venv"
+	@echo "make dev             - Run from repo with debug"
+	@echo "make clean           - Remove caches"
+	@echo "make clean-all       - Remove caches and venv"
 	@echo ""
-	@echo "Virtual Environment: $(VENV_DIR)"
-	@echo "Log file: $(LOGFILE)"
+	@echo "Prefix:     $(PREFIX)"
+	@echo "BIN_DIR:    $(BIN_DIR)"
+	@echo "PKG_ROOT:   $(PKG_ROOT)"
+	@echo "VENV_DIR:   $(VENV_DIR)"
+	@echo "Log file:   $(LOGFILE)"
 	@echo ""
-#======================================================================
 
