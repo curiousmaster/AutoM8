@@ -38,7 +38,7 @@ def load_config(
     playbook_override: Optional[str] = None,
     site: Optional[str] = None,
     targets: Optional[str] = None,
-    ask_vault: bool = False,
+    ask_vault: bool = True,
     splash_seconds: int = 10,
     debug_level: int = 0,
     # NEW

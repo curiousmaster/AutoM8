@@ -38,7 +38,7 @@ def _is_enter(ch: int) -> bool:
 class AppState:
     def __init__(self):
         self.playbook_rel: Optional[str] = None
-        self.vault: bool = False
+        self.vault: bool = True
         self.vault_password: Optional[str] = None
         self.running: bool = False
         self.last_rc: Optional[int] = None
