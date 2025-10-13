@@ -1,24 +1,30 @@
 # =====================================================================
 # File: autom8_pkg/core/inventory.py
-# Robust inventory parsing with YAML (recursive children -> hosts)
+# Inventory discovery + tree loader (ansible-inventory first, YAML fallback)
+# Level-agnostic (any depth), safe for mixed formats
 # =====================================================================
+
 from __future__ import annotations
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
+import json
 import re
+import subprocess
 
 try:
     import yaml  # type: ignore
 except Exception:
     yaml = None
 
-YAML_SITE_RE  = re.compile(r"^\s*site\s*:\s*([A-Za-z0-9_\-]+)\s*$")
-KEY_RE        = re.compile(r"^([A-Za-z0-9_.\-]+):\s*$")
-SKIP_GROUPS: Set[str] = {"all", "ungrouped", "children", "vars", "hosts"}
+# -------------------- Generic discovery helpers --------------------
 
-# ------------------- discovery / site -------------------
+YAML_SITE_RE = re.compile(r"^\s*site\s*:\s*([A-Za-z0-9_\-]+)\s*$")
+KEY_RE = re.compile(r"^([A-Za-z0-9_.\-]+):\s*$")
+SKIP_GROUPS: Set[str] = {"all", "ungrouped", "children", "vars", "hosts", "_meta"}
+
 
 def discover_inventory(inventory_root: Path) -> List[Path]:
+    """Find inventory files under a root directory or return the single file."""
     if inventory_root.is_file():
         return [inventory_root]
     files: List[Path] = []
@@ -27,197 +33,169 @@ def discover_inventory(inventory_root: Path) -> List[Path]:
             files += list(inventory_root.rglob(ext))
     return sorted(set(files))
 
-def extract_sites(inv_file: Path) -> Optional[str]:
+
+# -------------------- Prefer ansible-inventory --list --------------------
+
+def _ansible_inventory_json(inventory_root: Path) -> Optional[dict]:
     try:
-        with inv_file.open("r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                m = YAML_SITE_RE.match(line.strip())
-                if m:
-                    return m.group(1)
-    except OSError:
+        out = subprocess.check_output(
+            ["ansible-inventory", "-i", str(inventory_root), "--list"],
+            stderr=subprocess.STDOUT,
+        )
+        return json.loads(out.decode("utf-8", errors="ignore"))
+    except Exception:
         return None
-    return None
 
-def inventory_by_site(inventory_files: List[Path]) -> Dict[str, List[Path]]:
-    mapping: Dict[str, List[Path]] = {}
-    for f in inventory_files:
-        s = extract_sites(f) or "other"
-        mapping.setdefault(s, []).append(f)
-    return mapping
 
-# ------------------- YAML-based parsing (fixed) -------------------
-
-def _collect_groups_recursive(name: str, node: dict, groups: Dict[str, dict]):
-    """Register this group and recursively register all children."""
-    if not isinstance(node, dict):
-        return
-    # Register group itself
-    groups.setdefault(name, {})
-    # Merge shallow maps
-    for k, v in node.items():
-        if k not in groups[name]:
-            groups[name][k] = v
-        else:
-            if isinstance(groups[name][k], dict) and isinstance(v, dict):
-                groups[name][k].update(v)
-            else:
-                groups[name][k] = v
-    # Recurse into children
-    ch = node.get("children", {})
-    if isinstance(ch, dict):
-        for child_name, child_node in ch.items():
-            if isinstance(child_name, str) and isinstance(child_node, dict):
-                _collect_groups_recursive(child_name, child_node, groups)
-
-def _groups_from_yaml(data: dict) -> Dict[str, dict]:
+def _dict_tree_from_ansible_list(data: dict) -> Optional[dict]:
     """
-    Return a mapping of group_name -> node for ALL groups found anywhere,
-    including under all.children.* (recursively).
+    Convert `ansible-inventory --list` JSON (flat group map) into a nested tree.
+    children is a LIST of group names; hosts may be LIST or DICT.
     """
-    groups: Dict[str, dict] = {}
     if not isinstance(data, dict):
-        return groups
-    # 1) Top-level keys (e.g., 'all', direct groups)
-    for k, v in data.items():
-        if isinstance(k, str) and isinstance(v, dict):
-            _collect_groups_recursive(k, v, groups)
-    return groups
+        return None
 
-def _resolve_hosts(group_name: str, groups: Dict[str, dict], seen: Optional[Set[str]] = None) -> Set[str]:
-    """Return the full set of hosts for a group, recursing into its children."""
-    if seen is None:
-        seen = set()
-    if group_name in seen:
-        return set()
-    seen.add(group_name)
-    node = groups.get(group_name, {})
-    hosts: Set[str] = set()
-    # direct hosts
-    hmap = node.get("hosts", {})
-    if isinstance(hmap, dict):
-        for hk in hmap.keys():
-            if isinstance(hk, str):
-                hosts.add(hk)
+    groups = {k: v for k, v in data.items() if isinstance(v, dict) and k != "_meta"}
+    if not groups:
+        return None
+
+    def _hosts_from(node: dict) -> List[str]:
+        h = node.get("hosts", {})
+        if isinstance(h, dict):
+            return [str(x) for x in h.keys()]
+        if isinstance(h, list):
+            return [str(x) for x in h]
+        return []
+
+    def _children_from(node: dict) -> List[str]:
+        c = node.get("children", [])
+        if isinstance(c, dict):
+            return [str(x) for x in c.keys()]
+        if isinstance(c, list):
+            return [str(x) for x in c]
+        return []
+
+    def build_group(name: str, seen: Optional[Set[str]] = None) -> dict:
+        if seen is None:
+            seen = set()
+        if name in seen:
+            # avoid cycles
+            return {"name": name, "kind": "group", "children": []}
+        seen = set(seen) | {name}
+
+        node = groups.get(name, {})
+        children_nodes: List[dict] = []
+
+        # child groups first
+        for child_name in _children_from(node):
+            children_nodes.append(build_group(child_name, seen))
+
+        # then hosts
+        for host in _hosts_from(node):
+            children_nodes.append({"name": host, "kind": "host", "children": []})
+
+        return {"name": name, "kind": "group", "children": children_nodes}
+
+    root_name = "all" if "all" in groups else next(iter(groups.keys()))
+    return build_group(root_name)
+
+
+# -------------------- YAML fallback (tolerant merge) --------------------
+
+def _yaml_merge_groups(dst: dict, src: dict):
+    """
+    Deep-merge group dicts. Accepts canonical:
+      { children: {...}, hosts: {...}, vars: {...} }
+    and tolerant form where arbitrary keys (not hosts/children/vars)
+    are treated as implicit child groups.
+    """
+    if not isinstance(src, dict):
+        return
+
+    # vars (shallow)
+    if "vars" in src and isinstance(src["vars"], dict):
+        dst.setdefault("vars", {}).update(src["vars"])
+
+    # hosts
+    if "hosts" in src and isinstance(src["hosts"], dict):
+        dst.setdefault("hosts", {})
+        dst["hosts"].update(src["hosts"])
+
     # children
-    cmap = node.get("children", {})
-    if isinstance(cmap, dict):
-        for child in cmap.keys():
-            if isinstance(child, str):
-                hosts |= _resolve_hosts(child, groups, seen)
-    return hosts
+    if "children" in src and isinstance(src["children"], dict):
+        dst.setdefault("children", {})
+        for cname, cnode in src["children"].items():
+            dst["children"].setdefault(cname, {})
+            _yaml_merge_groups(dst["children"][cname], cnode if isinstance(cnode, dict) else {})
 
-def _collect_from_yaml(data: dict) -> Tuple[Dict[str, List[str]], List[str]]:
-    """
-    Returns (hostmap, grouplist)
-      hostmap: group -> [hosts...]
-      grouplist: all visible groups (even if they have 0 hosts)
-    """
-    groups = _groups_from_yaml(data)
-    # Visible groups = everything except structural names
-    visible = [g for g in groups.keys() if g not in SKIP_GROUPS]
-    hostmap: Dict[str, List[str]] = {}
-    for g in visible:
-        hostmap[g] = sorted(_resolve_hosts(g, groups))
-    return hostmap, sorted(visible)
-
-# ------------------- Fallback tolerant text scanner -------------------
-
-def _indent(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-def _is_key(line: str) -> Optional[str]:
-    m = KEY_RE.match(line.strip())
-    return m.group(1) if m else None
-
-def _collect_from_text(text: str) -> Tuple[Dict[str, List[str]], List[str]]:
-    """
-    Fallback: detect groups under 'children:' and '<group>: hosts:' blocks.
-    Returns (hostmap, grouplist)
-    """
-    hostmap: Dict[str, List[str]] = {}
-    headers: Set[str] = set()
-
-    stack: List[tuple[int, str]] = []
-    current_group: Optional[str] = None
-    in_hosts_for: Optional[str] = None
-
-    for raw in text.splitlines():
-        if not raw.strip():
+    # implicit children: any other mapping keys
+    for k, v in src.items():
+        if k in ("vars", "hosts", "children"):
             continue
-        ind = _indent(raw)
-        while stack and stack[-1][0] >= ind:
-            popped_indent, popped_key = stack.pop()
-            if in_hosts_for and popped_key == "hosts":
-                in_hosts_for = None
-            if current_group and popped_key == current_group:
-                current_group = None
+        if isinstance(v, dict):
+            dst.setdefault("children", {})
+            dst["children"].setdefault(k, {})
+            _yaml_merge_groups(dst["children"][k], v)
 
-        key = _is_key(raw)
-        if key is not None:
-            parent = stack[-1][1] if stack else None
-            # visible header?
-            if key not in SKIP_GROUPS and (parent == "children" or parent is None and key != "all"):
-                headers.add(key)
-                current_group = key
-            stack.append((ind, key))
-            if key == "hosts" and current_group:
-                in_hosts_for = current_group
-                hostmap.setdefault(in_hosts_for, [])
-            continue
 
-        if in_hosts_for:
-            hkey = _is_key(raw)
-            if hkey:
-                hostmap.setdefault(in_hosts_for, []).append(hkey)
+def _load_yaml_merged(inventory_root: Path) -> Optional[dict]:
+    files = discover_inventory(inventory_root)
+    if not files:
+        return None
 
-    for g in list(hostmap.keys()):
-        hostmap[g] = sorted(set(hostmap[g]))
+    root = {"children": {}, "hosts": {}}
+    any_data = False
 
-    return hostmap, sorted(headers)
-
-# ------------------- Public API -------------------
-
-def hosts_by_group(files: List[Path]) -> Dict[str, List[str]]:
-    acc: Dict[str, List[str]] = {}
     for f in files:
         try:
             content = f.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
+            if yaml is None:
+                continue
+            data = yaml.safe_load(content) or {}
+        except Exception:
             continue
-        if yaml is not None:
-            try:
-                data = yaml.safe_load(content) or {}
-                m, _ = _collect_from_yaml(data)
-            except Exception:
-                m, _ = _collect_from_text(content)
-        else:
-            m, _ = _collect_from_text(content)
-        for g, lst in m.items():
-            acc.setdefault(g, []).extend(lst)
-    for g in list(acc.keys()):
-        acc[g] = sorted(set(acc[g]))
-    return acc
-
-def list_groups(files: List[Path]) -> List[str]:
-    """Return ALL target types we can see, even if they have zero hosts."""
-    groups_seen: Set[str] = set()
-    for f in files:
-        try:
-            content = f.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
+        if not isinstance(data, dict):
             continue
-        if yaml is not None:
-            try:
-                data = yaml.safe_load(content) or {}
-                _, headers = _collect_from_yaml(data)
-            except Exception:
-                _, headers = _collect_from_text(content)
-        else:
-            _, headers = _collect_from_text(content)
-        groups_seen.update(headers)
-    return sorted(groups_seen)
 
-def any_hosts_in_files(files: List[Path]) -> bool:
-    hb = hosts_by_group(files)
-    return any(hb.get(g) for g in hb)
+        g = data.get("all")
+        if not isinstance(g, dict):
+            g = data  # accept file with a single group mapping
+        _yaml_merge_groups(root, g)
+        any_data = True
+
+    if not any_data:
+        return None
+
+    def build_group(name: str, node: dict) -> dict:
+        children_out: List[dict] = []
+        c = node.get("children", {})
+        if isinstance(c, dict):
+            for gname, gnode in c.items():
+                if not isinstance(gnode, dict):
+                    gnode = {}
+                children_out.append(build_group(gname, gnode))
+        h = node.get("hosts", {})
+        if isinstance(h, dict):
+            for hname in h.keys():
+                children_out.append({"name": str(hname), "kind": "host", "children": []})
+        return {"name": name, "kind": "group", "children": children_out}
+
+    return build_group("all", root)
+
+
+# -------------------- Public API --------------------
+
+def load_tree_data(inventory_root: Path) -> dict:
+    """
+    Return a nested tree dict of the inventory:
+      { "name": "all", "kind": "group", "children": [ ... ] }
+    Prefer ansible-inventory --list; fallback to YAML merge.
+    """
+    data = _ansible_inventory_json(inventory_root)
+    if data is not None:
+        tree = _dict_tree_from_ansible_list(data)
+        if tree is not None:
+            return tree
+    tree = _load_yaml_merged(inventory_root)
+    return tree or {"name": "all", "kind": "group", "children": []}
 

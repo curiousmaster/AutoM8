@@ -15,6 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--playbook", "-p", help="Playbook path under ./playbooks", default=None)
     p.add_argument("--site", help="Preselect site (inventory var 'site')", default=None)
     p.add_argument("--targets", help="Comma-separated hosts to preselect", default=None)
+    p.add_argument("-E", "--expand-levels", type=int, default=3, help="Initial tree expand levels (0=root only, default: 3)")
     p.add_argument("--no-splash", action="store_true", help="Skip splash screen")
     p.add_argument("--vault", action="store_true", help="Ask for Ansible vault password")
     p.add_argument("--debug", "-d", action="count", default=0, help="Increase verbosity")

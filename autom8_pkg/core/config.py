@@ -28,6 +28,8 @@ class AppConfig:
     default_playbook: Optional[str] = None
     ask_vault: bool = False
     debug_level: int = 0
+    # NEW: how many levels the tree expands initially (0 = root only)
+    expand_levels: int = 3
 
 
 def load_config(
@@ -39,6 +41,8 @@ def load_config(
     ask_vault: bool = False,
     splash_seconds: int = 10,
     debug_level: int = 0,
+    # NEW
+    expand_levels: int = 3,
 ) -> AppConfig:
     inv_root = Path(inventory_override) if inventory_override else project_root / "inventory"
     pb_root = project_root / "playbooks"
@@ -55,7 +59,8 @@ def load_config(
         default_targets=default_targets,
         default_playbook=playbook_override,
         ask_vault=ask_vault,
-        splash_seconds=splash_seconds,
-        debug_level=debug_level,
+        splash_seconds=int(splash_seconds),
+        debug_level=int(debug_level),
+        expand_levels=max(0, int(expand_levels)),
     )
 
